@@ -6,6 +6,7 @@
 #[path = "../iv.rs"]
 mod iv;
 
+use crate::iv::OneToOne;
 use defmt::info;
 use embassy_executor::Spawner;
 use embassy_stm32::gpio::{Level, Output, Speed};
@@ -14,8 +15,9 @@ use embassy_stm32::time::Hertz;
 use embassy_stm32::{bind_interrupts, dma, peripherals};
 use embassy_time::{Delay, Timer};
 use lora_phy::sx126x::{Stm32wl, Sx126x, TcxoCtrlVoltage};
-use lora_phy::{mod_params::*, sx126x};
 use lora_phy::{LoRa, RxMode};
+use lora_phy::{mod_params::*, sx126x};
+
 use {defmt_rtt as _, panic_probe as _};
 
 use self::iv::{InterruptHandler, Stm32wlInterfaceVariant, SubghzSpiDevice};
@@ -63,7 +65,16 @@ async fn main(_spawner: Spawner) {
         use_dcdc: true,
         rx_boost: false,
     };
-    let iv = Stm32wlInterfaceVariant::new(Irqs, use_high_power_pa, Some(ctrl1), Some(ctrl2), Some(ctrl3)).unwrap();
+    let iv = Stm32wlInterfaceVariant::new(
+        Irqs,
+        use_high_power_pa,
+        OneToOne::<true, true, _> {
+            rx: Some(ctrl1),
+            tx: Some(ctrl2),
+            enable: Some(ctrl3),
+        },
+    )
+    .unwrap();
     let mut lora = LoRa::new(Sx126x::new(spi, iv, config), false, Delay).await.unwrap();
 
     let mut debug_indicator = Output::new(p.PB9, Level::Low, Speed::Low);

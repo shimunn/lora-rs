@@ -14,11 +14,13 @@ use embassy_stm32::spi::Spi;
 use embassy_stm32::time::Hertz;
 use embassy_stm32::{bind_interrupts, dma, peripherals};
 use embassy_time::Delay;
+use lora_phy::LoRa;
 use lora_phy::lorawan_radio::LorawanRadio;
 use lora_phy::sx126x::{self, Stm32wl, Sx126x, TcxoCtrlVoltage};
-use lora_phy::LoRa;
-use lorawan_device::async_device::{region, Device, EmbassyTimer, JoinMode};
+use lorawan_device::async_device::{Device, EmbassyTimer, JoinMode, region};
 use lorawan_device::{AppEui, AppKey, DevEui};
+use crate::iv::OneToOne;
+
 use {defmt_rtt as _, panic_probe as _};
 
 use self::iv::{InterruptHandler, Stm32wlInterfaceVariant, SubghzSpiDevice};
@@ -79,7 +81,16 @@ async fn main(_spawner: Spawner) {
         use_dcdc: true,
         rx_boost: false,
     };
-    let iv = Stm32wlInterfaceVariant::new(Irqs, use_high_power_pa, Some(ctrl1), Some(ctrl2), Some(ctrl3)).unwrap();
+    let iv = Stm32wlInterfaceVariant::new(
+        Irqs,
+        use_high_power_pa,
+        OneToOne::<true, true, _> {
+            rx: Some(ctrl1),
+            tx: Some(ctrl2),
+            enable: Some(ctrl3),
+        },
+    )
+    .unwrap();
     let lora = LoRa::new(Sx126x::new(spi, iv, config), true, Delay).await.unwrap();
 
     let radio: LorawanRadio<_, _, MAX_TX_POWER> = lora.into();

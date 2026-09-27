@@ -9,12 +9,12 @@ mod iv;
 use defmt::info;
 
 use embassy_executor::Spawner;
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{Either, select};
 use embassy_stm32::exti::{self, ExtiInput};
 use embassy_stm32::gpio::{Level, Output, Pull, Speed};
 use embassy_stm32::mode::Async;
 use embassy_stm32::rng::{self, Rng};
-use embassy_stm32::spi::{mode::Master, Spi};
+use embassy_stm32::spi::{Spi, mode::Master};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::{bind_interrupts, dma, peripherals};
 use embassy_sync::{
@@ -23,12 +23,14 @@ use embassy_sync::{
 };
 use embassy_time::Delay;
 
+use crate::iv::OneToOne;
+use lora_phy::LoRa;
 use lora_phy::lorawan_radio::LorawanRadio;
 use lora_phy::sx126x::{self, Stm32wl, Sx126x, TcxoCtrlVoltage};
-use lora_phy::LoRa;
 use lorawan_device::async_device::{Device, EmbassyTimer, JoinMode, JoinResponse, SendResponse};
 use lorawan_device::region::{Subband, US915};
 use lorawan_device::{AppEui, AppKey, DevEui};
+
 use {defmt_rtt as _, panic_probe as _};
 
 use self::iv::{InterruptHandler, Stm32wlInterfaceVariant, SubghzSpiDevice};
@@ -93,7 +95,16 @@ async fn main(spawner: Spawner) {
         use_dcdc: true,
         rx_boost: false,
     };
-    let iv = Stm32wlInterfaceVariant::new(Irqs, use_high_power_pa, Some(ctrl1), Some(ctrl2), Some(ctrl3)).unwrap();
+    let iv = Stm32wlInterfaceVariant::new(
+        Irqs,
+        use_high_power_pa,
+        OneToOne::<true, true, _> {
+            rx: Some(ctrl1),
+            tx: Some(ctrl2),
+            enable: Some(ctrl3),
+        },
+    )
+    .unwrap();
     let lora = LoRa::new(Sx126x::new(spi, iv, config), false, Delay).await.unwrap();
 
     spawner.spawn(lora_task(lora, Rng::new(p.RNG, Irqs), CHANNEL.receiver()).unwrap());
@@ -102,8 +113,14 @@ async fn main(spawner: Spawner) {
     spawner.spawn(button_task(button, CHANNEL.sender()).unwrap());
 }
 
-type Stm32wlLoRa<'d> =
-    LoRa<Sx126x<iv::SubghzSpiDevice<Spi<'d, Async, Master>>, Stm32wlInterfaceVariant<Output<'d>>, Stm32wl>, Delay>;
+type Stm32wlLoRa<'d> = LoRa<
+    Sx126x<
+        iv::SubghzSpiDevice<Spi<'d, Async, Master>>,
+        Stm32wlInterfaceVariant<OneToOne<true, true, Output<'d>>>,
+        Stm32wl,
+    >,
+    Delay,
+>;
 
 #[embassy_executor::task]
 async fn lora_task(

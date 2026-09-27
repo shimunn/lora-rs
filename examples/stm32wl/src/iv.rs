@@ -1,15 +1,17 @@
 use cortex_m::peripheral::NVIC;
+use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::interrupt::InterruptExt;
-use embassy_stm32::{interrupt, pac};
+use embassy_stm32::peripherals::{PB8, PC13};
+use embassy_stm32::{Peri, interrupt, pac};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::Timer;
 use embedded_hal::digital::OutputPin;
 use embedded_hal_async::spi::{ErrorType, Operation, SpiBus, SpiDevice};
+use lora_phy::DelayNs;
 use lora_phy::mod_params::RadioError;
 use lora_phy::mod_params::RadioError::*;
 use lora_phy::mod_traits::InterfaceVariant;
-use lora_phy::DelayNs;
 
 /// Interrupt handler.
 pub struct InterruptHandler {}
@@ -23,39 +25,137 @@ impl interrupt::typelevel::Handler<interrupt::typelevel::SUBGHZ_RADIO> for Inter
 
 static IRQ_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
-/// Base for the InterfaceVariant implementation for an stm32wl/sx1262 combination
-pub struct Stm32wlInterfaceVariant<CTRL> {
-    use_high_power_pa: bool,
-    rf_switch_rx: Option<CTRL>,
-    rf_switch_tx: Option<CTRL>,
-    rf_switch_en: Option<CTRL>,
+/// Abstraction over the control circuitry used to switch the rf path
+/// Check your PCB schematic to determine the correct implementation
+pub trait RFSwitches {
+    const LP_SUPPORT: bool;
+    const HP_SUPPORT: bool;
+    fn switch_to_tx(&mut self) -> Result<(), RadioError>;
+    fn switch_to_rx(&mut self) -> Result<(), RadioError>;
+    fn enable_rf(&mut self) -> Result<(), RadioError>;
+    fn disable_rf(&mut self) -> Result<(), RadioError>;
 }
 
-impl<CTRL> Stm32wlInterfaceVariant<CTRL>
-where
-    CTRL: OutputPin,
-{
+/// RAK3172 Base Module not SIP
+// https://forum.rakwireless.com/t/rak3172-internal-schematic/4557/2
+pub struct RAK3172Module<'a> {
+    enable_tx: Output<'a>,
+    enable_rx: Output<'a>,
+}
+
+impl<'a> RAK3172Module<'a> {
+    pub fn new(tx: Peri<'a, PC13>, rx: Peri<'a, PB8>) -> Self {
+        Self {
+            enable_tx: Output::new(tx, Level::Low, Speed::High),
+            enable_rx: Output::new(rx, Level::Low, Speed::High),
+        }
+    }
+
+    fn switch(&mut self, tx: bool, rx: bool) -> Result<(), RadioError> {
+        self.enable_tx.set_level(tx.into());
+        self.enable_rx.set_level(rx.into());
+        Ok(())
+    }
+}
+
+impl RFSwitches for RAK3172Module<'_> {
+
+    const LP_SUPPORT: bool = false;
+
+    // Supports high power output only
+    const HP_SUPPORT: bool = true;
+
+    fn switch_to_tx(&mut self) -> Result<(), RadioError> {
+        self.switch(true, false)
+    }
+
+    fn switch_to_rx(&mut self) -> Result<(), RadioError> {
+        self.switch(false, true)
+    }
+
+    fn enable_rf(&mut self) -> Result<(), RadioError> {
+        Ok(())
+    }
+
+    fn disable_rf(&mut self) -> Result<(), RadioError> {
+        self.switch(false, false)
+    }
+}
+
+/// Maps rx, tx and enable to one pin each
+pub struct SwitchWithEnable<const HP: bool, const LP: bool, CTRL: OutputPin> {
+    pub rx: Option<CTRL>,
+    pub tx: Option<CTRL>,
+    pub enable: Option<CTRL>,
+}
+
+impl<const HP: bool, const LP: bool, CTRL: OutputPin> SwitchWithEnable<HP, LP, CTRL> {
+    fn switch(&mut self, rx: bool, tx: bool) -> Result<(), RadioError> {
+        self.rx
+            .iter_mut()
+            .try_for_each(|pin| pin.set_state(rx.into()).map_err(|_| RadioError::RfSwitchRx))?;
+        self.tx
+            .iter_mut()
+            .try_for_each(|pin| pin.set_state(tx.into()).map_err(|_| RadioError::RfSwitchTx))?;
+        Ok(())
+    }
+}
+impl<const HP: bool, const LP: bool, CTRL: OutputPin> RFSwitches for SwitchWithEnable<HP, LP, CTRL> {
+    const LP_SUPPORT: bool = LP;
+
+    const HP_SUPPORT: bool = HP;
+
+    fn switch_to_tx(&mut self) -> Result<(), RadioError> {
+        self.switch(false, true)
+    }
+
+    fn switch_to_rx(&mut self) -> Result<(), RadioError> {
+        self.switch(true, false)
+    }
+
+    fn enable_rf(&mut self) -> Result<(), RadioError> {
+        self.enable
+            .iter_mut()
+            .try_for_each(|pin| pin.set_state(true.into()).map_err(|_| RadioError::RfSwitchTx))
+    }
+
+    fn disable_rf(&mut self) -> Result<(), RadioError> {
+        self.enable
+            .iter_mut()
+            .try_for_each(|pin| pin.set_state(false.into()).map_err(|_| RadioError::RfSwitchTx))
+    }
+}
+
+/// Base for the InterfaceVariant implementation for an stm32wl/sx1262 combination
+pub struct Stm32wlInterfaceVariant<SW: RFSwitches> {
+    use_high_power_pa: bool,
+    switches: SW,
+}
+
+impl<SW: RFSwitches> Stm32wlInterfaceVariant<SW> {
     /// Create an InterfaceVariant instance for an stm32wl/sx1262 combination
     pub fn new(
         _irq: impl interrupt::typelevel::Binding<interrupt::typelevel::SUBGHZ_RADIO, InterruptHandler> + 'static,
         use_high_power_pa: bool,
-        rf_switch_rx: Option<CTRL>,
-        rf_switch_tx: Option<CTRL>,
-        rf_switch_en: Option<CTRL>,
+        switches: SW,
     ) -> Result<Self, RadioError> {
+        if use_high_power_pa && !SW::HP_SUPPORT {
+            return Err(RadioError::InvalidConfiguration);
+        }
+        if !use_high_power_pa && !SW::LP_SUPPORT {
+            return Err(RadioError::InvalidConfiguration);
+        }
         interrupt::SUBGHZ_RADIO.disable();
         Ok(Self {
             use_high_power_pa,
-            rf_switch_rx,
-            rf_switch_tx,
-            rf_switch_en,
+            switches,
         })
     }
 }
 
-impl<CTRL> InterfaceVariant for Stm32wlInterfaceVariant<CTRL>
+impl<SW> InterfaceVariant for Stm32wlInterfaceVariant<SW>
 where
-    CTRL: OutputPin,
+    SW: RFSwitches,
 {
     async fn reset(&mut self, _delay: &mut impl DelayNs) -> Result<(), RadioError> {
         pac::RCC.csr().modify(|w| w.set_rfrst(true));
@@ -76,41 +176,13 @@ where
     }
 
     async fn enable_rf_switch_rx(&mut self) -> Result<(), RadioError> {
-        if let Some(pin) = &mut self.rf_switch_tx {
-            pin.set_low().map_err(|_| RfSwitchTx)?
-        }
-        if let Some(pin) = &mut self.rf_switch_rx {
-            pin.set_high().map_err(|_| RfSwitchRx)?
-        }
-        if let Some(pin) = &mut self.rf_switch_en {
-            pin.set_high().map_err(|_| RfSwitchRx)?
-        }
-        Ok(())
+        self.switches.switch_to_rx()
     }
     async fn enable_rf_switch_tx(&mut self) -> Result<(), RadioError> {
-        if let Some(pin) = &mut self.rf_switch_rx {
-            pin.set_state((!self.use_high_power_pa).into())
-                .map_err(|_| RfSwitchTx)?
-        }
-        if let Some(pin) = &mut self.rf_switch_tx {
-            pin.set_high().map_err(|_| RfSwitchTx)?
-        }
-        if let Some(pin) = &mut self.rf_switch_en {
-            pin.set_high().map_err(|_| RfSwitchRx)?
-        }
-        Ok(())
+        self.switches.switch_to_tx()
     }
     async fn disable_rf_switch(&mut self) -> Result<(), RadioError> {
-        if let Some(pin) = &mut self.rf_switch_en {
-            pin.set_low().map_err(|_| RfSwitchRx)?
-        }
-        if let Some(pin) = &mut self.rf_switch_rx {
-            pin.set_low().map_err(|_| RfSwitchRx)?
-        }
-        if let Some(pin) = &mut self.rf_switch_tx {
-            pin.set_low().map_err(|_| RfSwitchTx)?
-        }
-        Ok(())
+        self.switches.disable_rf()
     }
 }
 pub struct SubghzSpiDevice<T>(pub T);
